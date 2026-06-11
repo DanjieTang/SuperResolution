@@ -1,0 +1,25 @@
+# Fixed dataset path
+dataset_path: ImagenetHighResolution
+
+# Fixed model settings
+device: mps
+epochs: 1
+input_image_size: 64
+output_image_size: 256
+
+# Sweep dimensions
+batch_size:
+  - 8
+  - 16
+
+lr: 
+  - 0.0001
+  - 0.0003
+  - 0.001
+
+min_lr: 0.00001
+weight_decay: 0.001
+
+# Optional W&B logging. Set both values to enable logging.
+project: null
+entity: null
