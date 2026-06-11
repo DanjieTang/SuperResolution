@@ -167,7 +167,10 @@ def build_command(
     for key, value in params.items():
         if value is None:
             continue
-        cmd.extend([f"--{key}", str(value)])
+        # Split space-separated strings so nargs="+" args (e.g. embedding_dim)
+        # become multiple CLI tokens
+        cmd.append(f"--{key}")
+        cmd.extend(str(value).split())
     cmd.extend(["--run_name", run_name])
     return cmd
 

@@ -4,10 +4,14 @@ dataset_path: ImagenetHighResolution
 # Fixed model settings
 device: mps
 epochs: 1
-input_image_size: 64
-output_image_size: 256
+input_image_size: 32
+output_image_size: 512
 
+# 16x upscale = 4 up stages, so 5 entries. Channels taper toward high
+# resolution to keep 512px activations affordable.
+embedding_dim: "3 256 256 128 64"
 # Sweep dimensions
+# batch sizes reduced from 8/16: 512px output uses ~4x the memory of 256px
 batch_size:
   - 8
   - 16

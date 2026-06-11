@@ -56,17 +56,21 @@ class ResBlock(nn.Module):
 
 
 class SelfAttentionBlock(nn.Module):
-    def __init__(self, embedding_dim: int, image_size: int, head_dim: int = 64, channel_per_group: int = 16):
+    def __init__(self, embedding_dim: int, image_size: int, patch_size: int = 4, head_dim: int = 64, channel_per_group: int = 16):
         super().__init__()
+        # Each patch_size x patch_size tile becomes one token, so the
+        # attention matrix shrinks by patch_size^4
+        self.patch_size: int = patch_size
+        self.token_dim: int = embedding_dim * patch_size ** 2
         self.head_dim: int = head_dim
-        self.num_head: int = embedding_dim // head_dim
+        self.num_head: int = self.token_dim // head_dim
         self.scale: float = head_dim ** -0.5
-        self.num_pixel = image_size ** 2
+        self.num_token = (image_size // patch_size) ** 2
         self.gnorm1 = nn.GroupNorm(embedding_dim // channel_per_group, embedding_dim)
         self.gnorm2 = nn.GroupNorm(embedding_dim // channel_per_group, embedding_dim)
 
         # QKV projection
-        self.qkv_proj = nn.Linear(embedding_dim, embedding_dim * 3)
+        self.qkv_proj = nn.Linear(self.token_dim, self.token_dim * 3)
 
         # Output layer
         self.output = nn.Conv2d(embedding_dim, embedding_dim, kernel_size=1)
@@ -84,17 +88,21 @@ class SelfAttentionBlock(nn.Module):
         tensor = self.gnorm1(tensor)
 
         # Reshape for self attention
-        batch_size, channel, height, width = tensor.shape
+        batch_size, _, height, width = tensor.shape
         tensor = tensor + self.positional_encoding
-        tensor = tensor.view(batch_size, channel, self.num_pixel)
+
+        # Fold each patch_size x patch_size tile into the channel dimension,
+        # turning every tile into a single token
+        tensor = F.pixel_unshuffle(tensor, self.patch_size)
+        tensor = tensor.view(batch_size, self.token_dim, self.num_token)
         tensor = tensor.permute(0, 2, 1)
 
         tensor = self.qkv_proj(tensor)
 
         query, key, value = torch.chunk(tensor, 3, dim=-1)
-        query = query.view(batch_size, self.num_pixel, self.num_head, self.head_dim)
-        key = key.view(batch_size, self.num_pixel, self.num_head, self.head_dim)
-        value = value.view(batch_size, self.num_pixel, self.num_head, self.head_dim)
+        query = query.view(batch_size, self.num_token, self.num_head, self.head_dim)
+        key = key.view(batch_size, self.num_token, self.num_head, self.head_dim)
+        value = value.view(batch_size, self.num_token, self.num_head, self.head_dim)
 
         query = query.transpose(1, 2)
         key = key.transpose(1, 2)
@@ -108,9 +116,12 @@ class SelfAttentionBlock(nn.Module):
 
         # Reshape for self attention output
         tensor = value.transpose(1, 2).contiguous()
-        tensor = tensor.view(batch_size, self.num_pixel, channel)
+        tensor = tensor.view(batch_size, self.num_token, self.token_dim)
         tensor = tensor.permute(0, 2, 1)
-        tensor = tensor.reshape(batch_size, channel, height, width)
+        tensor = tensor.reshape(batch_size, self.token_dim, height // self.patch_size, width // self.patch_size)
+
+        # Unfold tokens back to the full resolution feature map
+        tensor = F.pixel_shuffle(tensor, self.patch_size)
         tensor = self.output(tensor)
 
         tensor = tensor + skip_tensor
@@ -124,17 +135,20 @@ class SelfAttentionBlock(nn.Module):
         return tensor
 
 class SuperResolution(nn.Module):
+    # Attention only at low resolutions: token count grows with
+    # resolution^2, so high-res stages stay convolution-only
+    MAX_ATTENTION_RESOLUTION = 64
+
     def __init__(self, embedding_dim: list[int] = [3, 128, 256], input_image_size: int = 64):
         super().__init__()
         self.module_list = nn.ModuleList()
 
         for i in range(len(embedding_dim) - 1):
-            if i == 0:
-                self.module_list.append(ResBlock(in_channel=embedding_dim[i], out_channel=embedding_dim[i+1]))
-                self.module_list.append(SelfAttentionBlock(embedding_dim=embedding_dim[i+1], image_size=input_image_size))
-                self.module_list.append(ResBlock(in_channel=embedding_dim[i+1], out_channel=embedding_dim[i+1], up=True))
-            else:
-                self.module_list.append(ResBlock(in_channel=embedding_dim[i], out_channel=embedding_dim[i+1], up=True))
+            resolution = input_image_size * 2 ** i
+            self.module_list.append(ResBlock(in_channel=embedding_dim[i], out_channel=embedding_dim[i+1]))
+            if resolution <= self.MAX_ATTENTION_RESOLUTION:
+                self.module_list.append(SelfAttentionBlock(embedding_dim=embedding_dim[i+1], image_size=resolution))
+            self.module_list.append(ResBlock(in_channel=embedding_dim[i+1], out_channel=embedding_dim[i+1], up=True))
         self.module_list.append(ResBlock(in_channel=embedding_dim[-1], out_channel=3))
 
     def forward(self, tensor):
