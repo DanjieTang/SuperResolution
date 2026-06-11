@@ -9,6 +9,7 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
+import yaml
 
 import wandb
 import os
@@ -50,6 +51,9 @@ def main():
     run_log_dir = os.path.join("train_log", datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(run_log_dir, exist_ok=True)
 
+    with open(os.path.join(run_log_dir, "hyperparameters.yaml"), "w") as f:
+        yaml.dump(vars(args), f)
+
     if use_wandb:
         run = wandb.init(
             entity=args.entity,
@@ -75,10 +79,6 @@ def main():
     ).to(args.device)
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Mixed precision only on CUDA, matching the original CUDA notebook
-    use_amp = args.device.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
     # Optimizer & Scheduler
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -98,15 +98,13 @@ def main():
 
             # Forward pass
             optimizer.zero_grad()
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                predicted_high_resolution_image = model(low_resolution_image)
-                loss = criterion(predicted_high_resolution_image, high_resolution_image)
+            predicted_high_resolution_image = model(low_resolution_image)
+            loss = criterion(predicted_high_resolution_image, high_resolution_image)
 
             # Backward pass
-            scaler.scale(loss).backward()
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
 
             # Record loss
@@ -152,9 +150,8 @@ def main():
                 low_resolution_image = F.interpolate(images, size=(args.input_image_size, args.input_image_size), mode='bicubic', align_corners=False).to(args.device)
                 high_resolution_image = images.to(args.device)
 
-                with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-                    predicted_high_resolution_image = model(low_resolution_image)
-                    loss = criterion(predicted_high_resolution_image, high_resolution_image)
+                predicted_high_resolution_image = model(low_resolution_image)
+                loss = criterion(predicted_high_resolution_image, high_resolution_image)
 
                 # Record loss
                 epoch_val_loss.append(loss.item())

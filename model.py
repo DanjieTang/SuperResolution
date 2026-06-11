@@ -71,60 +71,12 @@ class SelfAttentionBlock(nn.Module):
         # Output layer
         self.output = nn.Conv2d(embedding_dim, embedding_dim, kernel_size=1)
 
-        # Positional embedding for patches, registered as a buffer so it follows model.to(device)
-        self.register_buffer(
-            "positional_encoding",
-            self.sinusoidal_positional_encoding_2d(image_size, image_size, embedding_dim),
-            persistent=False,
-        )
+        # Learned positional embedding for patches
+        self.positional_encoding = nn.Parameter(torch.randn(embedding_dim, image_size, image_size))
 
         # Feed Forward Layer
         self.ffn1 = nn.Conv2d(embedding_dim, embedding_dim * 8, kernel_size=1)
         self.ffn2 = nn.Conv2d(embedding_dim * 8, embedding_dim, kernel_size=1)
-
-    def sinusoidal_positional_encoding_2d(self, height: int, width: int, channel: int) -> torch.Tensor:
-        """
-        Generate a 2D sinusoidal positional encoding.
-
-        :param height: The height of the encoding.
-        :param width: The width of the encoding.
-        :param channel: The number of channels in the encoding.
-        :return: A tensor of shape (channel, width, height) containing the 2D positional encoding.
-        """
-        if channel % 2 != 0:
-            raise ValueError("The 'channel' dimension must be an even number.")
-
-        # First, build in (height, width, channel) format
-        pe = torch.zeros(height, width, channel)
-
-        half_ch = channel // 2
-
-        # Precompute the exponent for row and column
-        row_div_term = torch.exp(
-            -math.log(10000.0) * (torch.arange(0, half_ch, 2).float() / half_ch)
-        )
-        col_div_term = torch.exp(
-            -math.log(10000.0) * (torch.arange(0, half_ch, 2).float() / half_ch)
-        )
-
-        for h in range(height):
-            for w in range(width):
-                # Encode row index (h) into the first half of the channels
-                for i in range(0, half_ch, 2):
-                    pe[h, w, i]     = math.sin(h * row_div_term[i // 2])
-                    pe[h, w, i + 1] = math.cos(h * row_div_term[i // 2])
-
-                # Encode column index (w) into the second half of the channels
-                for j in range(0, half_ch, 2):
-                    pe[h, w, half_ch + j]     = math.sin(w * col_div_term[j // 2])
-                    pe[h, w, half_ch + j + 1] = math.cos(w * col_div_term[j // 2])
-
-        # Permute to get the shape (channel, width, height).
-        # Currently pe is (height, width, channel) = (H, W, C)
-        # We want (C, W, H), so we do permute(2, 1, 0).
-        pe = pe.permute(2, 1, 0)  # => (channel, width, height)
-
-        return pe
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
         skip_tensor = tensor
@@ -177,10 +129,12 @@ class SuperResolution(nn.Module):
         self.module_list = nn.ModuleList()
 
         for i in range(len(embedding_dim) - 1):
-            self.module_list.append(ResBlock(in_channel=embedding_dim[i], out_channel=embedding_dim[i+1]))
             if i == 0:
+                self.module_list.append(ResBlock(in_channel=embedding_dim[i], out_channel=embedding_dim[i+1]))
                 self.module_list.append(SelfAttentionBlock(embedding_dim=embedding_dim[i+1], image_size=input_image_size))
-            self.module_list.append(ResBlock(in_channel=embedding_dim[i+1], out_channel=embedding_dim[i+1], up=True))
+                self.module_list.append(ResBlock(in_channel=embedding_dim[i+1], out_channel=embedding_dim[i+1], up=True))
+            else:
+                self.module_list.append(ResBlock(in_channel=embedding_dim[i], out_channel=embedding_dim[i+1], up=True))
         self.module_list.append(ResBlock(in_channel=embedding_dim[-1], out_channel=3))
 
     def forward(self, tensor):
