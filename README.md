@@ -26,6 +26,14 @@ python train.py --dataset_path /path/to/imagenet --device cuda:0 --batch_size 8 
 
 Enable W&B logging by passing both `--project` and `--entity`.
 
+### Optional: latent diffusion
+
+Passing `--use_vae` trains in the latent space of a frozen pretrained VAE (`stabilityai/sd-vae-ft-ema`, downloaded from Hugging Face on first run) instead of pixel space. The patch size defaults to 2 on the 8x-smaller latents, keeping the token count identical. Requires the optional dependency: `uv sync --extra vae`.
+
+```bash
+python train.py --use_vae
+```
+
 ## Hyperparameter sweep
 
 ```bash

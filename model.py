@@ -109,7 +109,8 @@ class DiT(nn.Module):
     Predicts the flow matching velocity for the noisy image, conditioned on
     the timestep, the masked (known pixels only) image, and the known-region
     mask. Inputs are concatenated along channels:
-    3 noisy image + 3 masked image + 1 mask = 7.
+    3 noisy image + 3 masked image + 1 mask = 7 in pixel space, or
+    4 noisy latent + 4 masked latent + 1 mask = 9 with --use_vae.
 
     The patch embedding folds each patch_size x patch_size tile into one
     token, the same tiling trick as in the super resolution attention.

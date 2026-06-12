@@ -16,18 +16,26 @@ import os
 from contextlib import nullcontext
 from datetime import datetime
 
+# The pretrained VAE downsamples by 8x, so a 512 canvas becomes a 64x64x4 latent
+VAE_DOWNSAMPLE_FACTOR = 8
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train an Outpainting Model (pixel-space flow matching DiT)")
+    parser = argparse.ArgumentParser(description="Train an Outpainting Model (flow matching DiT)")
 
     # Dataset & Paths
     parser.add_argument("--dataset_path", type=str, default="ImagenetHighResolution")
 
     # Model Architecture
     parser.add_argument("--canvas_size", type=int, default=512)
-    parser.add_argument("--patch_size", type=int, default=16)
+    parser.add_argument("--patch_size", type=int, default=None, help="Defaults to 16 in pixel space, 2 in VAE latent space")
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--num_head", type=int, default=8)
+
+    # Optional latent diffusion: train on frozen pretrained VAE latents
+    # instead of raw pixels (downloads the VAE from Hugging Face)
+    parser.add_argument("--use_vae", action="store_true")
+    parser.add_argument("--vae", type=str, default="stabilityai/sd-vae-ft-ema")
 
     # Training Hyperparameters
     parser.add_argument("--epochs", type=int, default=1)
@@ -44,25 +52,42 @@ def parse_args():
     parser.add_argument("--entity", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.patch_size is None:
+        args.patch_size = 2 if args.use_vae else 16
+    return args
 
 @torch.no_grad()
-def sample(model: DiT, known_image: torch.Tensor, mask: torch.Tensor, steps: int) -> torch.Tensor:
+def encode(vae, images: torch.Tensor) -> torch.Tensor:
+    """Map pixels to the space the model works in: VAE latents, or pixels unchanged."""
+    if vae is None:
+        return images
+    return vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
+
+@torch.no_grad()
+def decode(vae, tensor: torch.Tensor) -> torch.Tensor:
+    """Map the model's working space back to pixels."""
+    if vae is None:
+        return tensor
+    return vae.decode(tensor / vae.config.scaling_factor).sample
+
+@torch.no_grad()
+def sample(model: DiT, known: torch.Tensor, mask: torch.Tensor, steps: int) -> torch.Tensor:
     """
-    Generate images by integrating the learned velocity field from pure noise
-    (t=1) back to data (t=0) with Euler steps.
+    Generate by integrating the learned velocity field from pure noise (t=1)
+    back to data (t=0) with Euler steps.
     """
-    image = torch.randn_like(known_image)
-    timesteps = torch.linspace(1.0, 0.0, steps + 1, device=image.device)
+    tensor = torch.randn_like(known)
+    timesteps = torch.linspace(1.0, 0.0, steps + 1, device=tensor.device)
 
     for i in range(steps):
-        timestep = timesteps[i].expand(image.shape[0])
-        velocity = model(image, timestep, known_image, mask)
-        image = image - (timesteps[i] - timesteps[i + 1]) * velocity
+        timestep = timesteps[i].expand(tensor.shape[0])
+        velocity = model(tensor, timestep, known, mask)
+        tensor = tensor - (timesteps[i] - timesteps[i + 1]) * velocity
 
-    return image
+    return tensor
 
-def visualize(model, images, mask, args, run_log_dir, epoch, step, use_wandb, run):
+def visualize(model, vae, images, mask, args, run_log_dir, epoch, step, use_wandb, run):
     """Outpaint the first image of the batch and save input/output side by side."""
     model.eval()
 
@@ -70,7 +95,10 @@ def visualize(model, images, mask, args, run_log_dir, epoch, step, use_wandb, ru
     image_mask = mask[:1]
     masked_image = image * image_mask
 
-    generated = sample(model, masked_image, image_mask, args.sample_steps)
+    known = encode(vae, masked_image)
+    working_mask = F.interpolate(image_mask, size=known.shape[-2:], mode="nearest")
+
+    generated = decode(vae, sample(model, known, working_mask, args.sample_steps))
 
     # Keep the original pixels where they are known
     generated = image * image_mask + generated * (1 - image_mask)
@@ -98,18 +126,20 @@ def visualize(model, images, mask, args, run_log_dir, epoch, step, use_wandb, ru
 
     model.train()
 
-def flow_matching_loss(model, images, mask, criterion):
-    masked_image = images * mask
+def flow_matching_loss(model, vae, images, mask, criterion):
+    target = encode(vae, images)
+    known = encode(vae, images * mask)
+    working_mask = F.interpolate(mask, size=target.shape[-2:], mode="nearest")
 
     # Flow matching: interpolate between data (t=0) and noise (t=1),
     # the model learns the constant velocity from data to noise
-    noise = torch.randn_like(images)
-    timestep = torch.rand(images.shape[0], device=images.device)
+    noise = torch.randn_like(target)
+    timestep = torch.rand(target.shape[0], device=target.device)
     t = timestep.view(-1, 1, 1, 1)
-    noisy_image = (1 - t) * images + t * noise
-    velocity_target = noise - images
+    noisy_target = (1 - t) * target + t * noise
+    velocity_target = noise - target
 
-    velocity_prediction = model(noisy_image, timestep, masked_image, mask)
+    velocity_prediction = model(noisy_target, timestep, known, working_mask)
     return criterion(velocity_prediction, velocity_target)
 
 def main():
@@ -136,9 +166,25 @@ def main():
 
     train_loader, val_loader = prepare_dataset(args.dataset_path, args.batch_size, canvas_size=args.canvas_size)
 
+    # Frozen pretrained VAE (latent diffusion) or pixel space
+    vae = None
+    if args.use_vae:
+        try:
+            from diffusers import AutoencoderKL
+        except ImportError:
+            raise ImportError("--use_vae requires diffusers: run 'uv sync --extra vae' or 'pip install diffusers'")
+        vae = AutoencoderKL.from_pretrained(args.vae).to(args.device)
+        vae.requires_grad_(False)
+        vae.eval()
+
+    working_channels = 4 if args.use_vae else 3
+    working_size = args.canvas_size // VAE_DOWNSAMPLE_FACTOR if args.use_vae else args.canvas_size
+
     model = DiT(
-        image_size=args.canvas_size,
+        image_size=working_size,
         patch_size=args.patch_size,
+        in_channels=working_channels * 2 + 1,
+        out_channels=working_channels,
         hidden_dim=args.hidden_dim,
         depth=args.depth,
         num_head=args.num_head,
@@ -167,7 +213,7 @@ def main():
             # Forward pass
             optimizer.zero_grad()
             with autocast:
-                loss = flow_matching_loss(model, images, mask, criterion)
+                loss = flow_matching_loss(model, vae, images, mask, criterion)
 
             # Backward pass
             loss.backward()
@@ -180,7 +226,7 @@ def main():
 
             if step % args.visualize_every == 0:
                 with autocast:
-                    visualize(model, images, mask, args, run_log_dir, epoch, step, use_wandb, run)
+                    visualize(model, vae, images, mask, args, run_log_dir, epoch, step, use_wandb, run)
 
         avg_train_loss = np.mean(epoch_train_loss)
         train_losses.append(avg_train_loss)
@@ -192,7 +238,7 @@ def main():
                 images = images.to(args.device)
                 mask = sample_known_region_mask(images.shape[0], args.canvas_size, args.device)
                 with autocast:
-                    loss = flow_matching_loss(model, images, mask, criterion)
+                    loss = flow_matching_loss(model, vae, images, mask, criterion)
 
                 # Record loss
                 epoch_val_loss.append(loss.item())

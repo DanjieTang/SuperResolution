@@ -167,6 +167,11 @@ def build_command(
     for key, value in params.items():
         if value is None:
             continue
+        # Booleans are store_true flags: present when true, omitted when false
+        if isinstance(value, bool):
+            if value:
+                cmd.append(f"--{key}")
+            continue
         # Split space-separated strings so nargs="+" args (e.g. embedding_dim)
         # become multiple CLI tokens
         cmd.append(f"--{key}")

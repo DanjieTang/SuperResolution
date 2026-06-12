@@ -11,3 +11,7 @@ dependencies = [
     "tqdm>=4.68.2",
     "wandb>=0.27.2",
 ]
+
+[project.optional-dependencies]
+# Only needed for latent diffusion training with --use_vae
+vae = ["diffusers>=0.31.0"]
