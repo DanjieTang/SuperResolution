@@ -3,155 +3,159 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-class ResBlock(nn.Module):
-    def __init__(self, in_channel: int, out_channel: int, up: bool = False):
+
+def zero_out(layer: nn.Module) -> nn.Module:
+    """
+    Zero out the parameters of a layer.
+
+    :param layer: The layer to zero out.
+    :return: The zeroed layer.
+    """
+    for p in layer.parameters():
+        p.detach().zero_()
+    return layer
+
+
+class TimestepEmbedding(nn.Module):
+    """Sinusoidal embedding of the flow matching timestep, followed by an MLP."""
+
+    def __init__(self, hidden_dim: int, frequency_dim: int = 256):
         super().__init__()
+        self.frequency_dim = frequency_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
-        # Upsampling or downsampling only for skip connection
-        self.up = up
-
-        # Normalization layers
-        self.norm1 = nn.BatchNorm2d(in_channel)
-        self.norm2 = nn.BatchNorm2d(out_channel)
-
-        # Convolution layers
-        self.conv1 = nn.Conv2d(in_channel, out_channel, kernel_size=3, padding=1)
-        self.conv2 = self.zero_out(nn.Conv2d(out_channel, out_channel, kernel_size=3, padding=1))
-
-        # Skip connection
-        if in_channel != out_channel or up:
-            self.skip_connection = nn.Sequential(
-                nn.Conv2d(in_channel, out_channel, kernel_size=1),
-                nn.Upsample(scale_factor=2) if up else nn.Identity(),
-            )
-        else:
-            self.skip_connection = nn.Identity()
-
-    def zero_out(self, layer: nn.Module) -> nn.Module:
-        """
-        Zero out the parameters of a layer.
-
-        :param layer: The layer to zero out.
-        :return: The zeroed layer.
-        """
-        for p in layer.parameters():
-            p.detach().zero_()
-        return layer
-
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        skip_tensor = self.skip_connection(tensor)
-
-        # Main path
-        tensor = self.norm1(tensor)
-        tensor = F.relu(tensor)
-        if self.up:
-            tensor = F.interpolate(tensor, scale_factor=2)
-        tensor = self.conv1(tensor)
-        tensor = self.norm2(tensor)
-        tensor = F.relu(tensor)
-        tensor = self.conv2(tensor)
-
-        tensor += skip_tensor
-        return tensor
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        half_dim = self.frequency_dim // 2
+        frequency = torch.exp(-math.log(10000) * torch.arange(half_dim, device=timestep.device) / half_dim)
+        angle = timestep[:, None].float() * frequency[None, :]
+        embedding = torch.cat([torch.cos(angle), torch.sin(angle)], dim=-1)
+        return self.mlp(embedding)
 
 
-class SelfAttentionBlock(nn.Module):
-    def __init__(self, embedding_dim: int, image_size: int, patch_size: int = 4, head_dim: int = 64, channel_per_group: int = 16):
+def modulate(tokens: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return tokens * (1 + scale[:, None]) + shift[:, None]
+
+
+class DiTBlock(nn.Module):
+    """Transformer block with adaLN-zero conditioning on the timestep."""
+
+    def __init__(self, hidden_dim: int, num_head: int, mlp_ratio: int = 4):
         super().__init__()
-        # Each patch_size x patch_size tile becomes one token, so the
-        # attention matrix shrinks by patch_size^4
-        self.patch_size: int = patch_size
-        self.token_dim: int = embedding_dim * patch_size ** 2
-        self.head_dim: int = head_dim
-        self.num_head: int = self.token_dim // head_dim
-        self.scale: float = head_dim ** -0.5
-        self.num_token = (image_size // patch_size) ** 2
-        self.gnorm1 = nn.GroupNorm(embedding_dim // channel_per_group, embedding_dim)
-        self.gnorm2 = nn.GroupNorm(embedding_dim // channel_per_group, embedding_dim)
+        self.num_head = num_head
 
-        # QKV projection
-        self.qkv_proj = nn.Linear(self.token_dim, self.token_dim * 3)
+        self.norm1 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(hidden_dim, elementwise_affine=False)
 
-        # Output layer
-        self.output = nn.Conv2d(embedding_dim, embedding_dim, kernel_size=1)
+        self.qkv_proj = nn.Linear(hidden_dim, hidden_dim * 3)
+        self.attention_output = nn.Linear(hidden_dim, hidden_dim)
 
-        # Learned positional embedding for patches
-        self.positional_encoding = nn.Parameter(torch.randn(embedding_dim, image_size, image_size))
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * mlp_ratio),
+            nn.GELU(),
+            nn.Linear(hidden_dim * mlp_ratio, hidden_dim),
+        )
 
-        # Feed Forward Layer
-        self.ffn1 = nn.Conv2d(embedding_dim, embedding_dim * 8, kernel_size=1)
-        self.ffn2 = nn.Conv2d(embedding_dim * 8, embedding_dim, kernel_size=1)
+        # Produces shift/scale/gate for the attention and MLP branches.
+        # Zero-initialized so every block starts as the identity function
+        self.modulation = zero_out(nn.Linear(hidden_dim, hidden_dim * 6))
 
-    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        skip_tensor = tensor
+    def attention(self, tokens: torch.Tensor) -> torch.Tensor:
+        batch_size, num_token, hidden_dim = tokens.shape
 
-        tensor = self.gnorm1(tensor)
+        query, key, value = torch.chunk(self.qkv_proj(tokens), 3, dim=-1)
+        query = query.view(batch_size, num_token, self.num_head, -1).transpose(1, 2)
+        key = key.view(batch_size, num_token, self.num_head, -1).transpose(1, 2)
+        value = value.view(batch_size, num_token, self.num_head, -1).transpose(1, 2)
 
-        # Reshape for self attention
-        batch_size, _, height, width = tensor.shape
-        tensor = tensor + self.positional_encoding
+        # Fused kernel never materializes the full attention matrix
+        tokens = F.scaled_dot_product_attention(query, key, value)
 
-        # Fold each patch_size x patch_size tile into the channel dimension,
-        # turning every tile into a single token
-        tensor = F.pixel_unshuffle(tensor, self.patch_size)
-        tensor = tensor.view(batch_size, self.token_dim, self.num_token)
-        tensor = tensor.permute(0, 2, 1)
+        tokens = tokens.transpose(1, 2).reshape(batch_size, num_token, hidden_dim)
+        return self.attention_output(tokens)
 
-        tensor = self.qkv_proj(tensor)
+    def forward(self, tokens: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+        shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp = torch.chunk(
+            self.modulation(F.silu(conditioning)), 6, dim=-1
+        )
 
-        query, key, value = torch.chunk(tensor, 3, dim=-1)
-        query = query.view(batch_size, self.num_token, self.num_head, self.head_dim)
-        key = key.view(batch_size, self.num_token, self.num_head, self.head_dim)
-        value = value.view(batch_size, self.num_token, self.num_head, self.head_dim)
+        tokens = tokens + gate_attn[:, None] * self.attention(modulate(self.norm1(tokens), shift_attn, scale_attn))
+        tokens = tokens + gate_mlp[:, None] * self.mlp(modulate(self.norm2(tokens), shift_mlp, scale_mlp))
+        return tokens
 
-        query = query.transpose(1, 2)
-        key = key.transpose(1, 2)
-        value = value.transpose(1, 2)
 
-        # Self attention
-        attention_raw = torch.matmul(query, key.transpose(2, 3))
-        attention_scaled = attention_raw * self.scale
-        attention_score = torch.softmax(attention_scaled, dim=-1)
-        value = torch.matmul(attention_score, value)
+class FinalLayer(nn.Module):
+    """Modulated projection from tokens back to latent patches."""
 
-        # Reshape for self attention output
-        tensor = value.transpose(1, 2).contiguous()
-        tensor = tensor.view(batch_size, self.num_token, self.token_dim)
-        tensor = tensor.permute(0, 2, 1)
-        tensor = tensor.reshape(batch_size, self.token_dim, height // self.patch_size, width // self.patch_size)
-
-        # Unfold tokens back to the full resolution feature map
-        tensor = F.pixel_shuffle(tensor, self.patch_size)
-        tensor = self.output(tensor)
-
-        tensor = tensor + skip_tensor
-
-        # Feed Forward Layer
-        tensor = self.gnorm2(tensor)
-        tensor = self.ffn1(tensor)
-        tensor = F.relu(tensor)
-        tensor = self.ffn2(tensor)
-
-        return tensor
-
-class SuperResolution(nn.Module):
-    # Attention only at low resolutions: token count grows with
-    # resolution^2, so high-res stages stay convolution-only
-    MAX_ATTENTION_RESOLUTION = 64
-
-    def __init__(self, embedding_dim: list[int] = [3, 128, 256], input_image_size: int = 64):
+    def __init__(self, hidden_dim: int, patch_size: int, out_channels: int):
         super().__init__()
-        self.module_list = nn.ModuleList()
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.modulation = zero_out(nn.Linear(hidden_dim, hidden_dim * 2))
+        self.projection = zero_out(nn.Linear(hidden_dim, patch_size ** 2 * out_channels))
 
-        for i in range(len(embedding_dim) - 1):
-            resolution = input_image_size * 2 ** i
-            self.module_list.append(ResBlock(in_channel=embedding_dim[i], out_channel=embedding_dim[i+1]))
-            if resolution <= self.MAX_ATTENTION_RESOLUTION:
-                self.module_list.append(SelfAttentionBlock(embedding_dim=embedding_dim[i+1], image_size=resolution))
-            self.module_list.append(ResBlock(in_channel=embedding_dim[i+1], out_channel=embedding_dim[i+1], up=True))
-        self.module_list.append(ResBlock(in_channel=embedding_dim[-1], out_channel=3))
+    def forward(self, tokens: torch.Tensor, conditioning: torch.Tensor) -> torch.Tensor:
+        shift, scale = torch.chunk(self.modulation(F.silu(conditioning)), 2, dim=-1)
+        tokens = modulate(self.norm(tokens), shift, scale)
+        return self.projection(tokens)
 
-    def forward(self, tensor):
-        for module in self.module_list:
-            tensor = module(tensor)
-        return tensor
+
+class DiT(nn.Module):
+    """
+    Diffusion transformer for outpainting in VAE latent space.
+
+    Predicts the flow matching velocity for the noisy latent, conditioned on
+    the timestep, the latent of the masked (known pixels only) image, and the
+    known-region mask. Inputs are concatenated along channels:
+    4 noisy latent + 4 known latent + 1 mask = 9.
+    """
+
+    def __init__(
+        self,
+        latent_size: int = 64,
+        patch_size: int = 2,
+        in_channels: int = 9,
+        out_channels: int = 4,
+        hidden_dim: int = 512,
+        depth: int = 12,
+        num_head: int = 8,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.out_channels = out_channels
+        self.token_per_side = latent_size // patch_size
+
+        self.patch_embed = nn.Conv2d(in_channels, hidden_dim, kernel_size=patch_size, stride=patch_size)
+        self.positional_encoding = nn.Parameter(torch.randn(1, self.token_per_side ** 2, hidden_dim) * 0.02)
+        self.timestep_embedding = TimestepEmbedding(hidden_dim)
+
+        self.blocks = nn.ModuleList([DiTBlock(hidden_dim, num_head) for _ in range(depth)])
+        self.final_layer = FinalLayer(hidden_dim, patch_size, out_channels)
+
+    def unpatchify(self, tokens: torch.Tensor) -> torch.Tensor:
+        batch_size = tokens.shape[0]
+        side = self.token_per_side
+        tokens = tokens.view(batch_size, side, side, self.patch_size, self.patch_size, self.out_channels)
+        tokens = tokens.permute(0, 5, 1, 3, 2, 4)
+        return tokens.reshape(batch_size, self.out_channels, side * self.patch_size, side * self.patch_size)
+
+    def forward(
+        self,
+        noisy_latent: torch.Tensor,
+        timestep: torch.Tensor,
+        known_latent: torch.Tensor,
+        known_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        tensor = torch.cat([noisy_latent, known_latent, known_mask], dim=1)
+
+        tokens = self.patch_embed(tensor).flatten(2).transpose(1, 2)
+        tokens = tokens + self.positional_encoding
+
+        conditioning = self.timestep_embedding(timestep)
+        for block in self.blocks:
+            tokens = block(tokens, conditioning)
+
+        tokens = self.final_layer(tokens, conditioning)
+        return self.unpatchify(tokens)

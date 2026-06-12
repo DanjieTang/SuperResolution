@@ -1,5 +1,6 @@
 torch
 torchvision
+diffusers
 matplotlib
 tqdm
 numpy

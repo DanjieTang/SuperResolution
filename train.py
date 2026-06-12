@@ -1,10 +1,11 @@
-from dataloader import prepare_dataset
-from model import SuperResolution
+from dataloader import prepare_dataset, sample_known_region_mask
+from model import DiT
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from diffusers import AutoencoderKL
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -13,26 +14,35 @@ import yaml
 
 import wandb
 import os
+from contextlib import nullcontext
 from datetime import datetime
 
+# The VAE downsamples by 8x, so a 512 canvas becomes a 64x64x4 latent
+VAE_DOWNSAMPLE_FACTOR = 8
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a SuperResolution Model")
+    parser = argparse.ArgumentParser(description="Train an Outpainting Model (latent flow matching DiT)")
 
     # Dataset & Paths
     parser.add_argument("--dataset_path", type=str, default="ImagenetHighResolution")
 
     # Model Architecture
-    parser.add_argument("--embedding_dim", type=int, nargs="+", default=[3, 128, 256])
-    parser.add_argument("--input_image_size", type=int, default=64)
-    parser.add_argument("--output_image_size", type=int, default=256)
+    parser.add_argument("--canvas_size", type=int, default=512)
+    parser.add_argument("--patch_size", type=int, default=2)
+    parser.add_argument("--hidden_dim", type=int, default=512)
+    parser.add_argument("--depth", type=int, default=12)
+    parser.add_argument("--num_head", type=int, default=8)
+    parser.add_argument("--vae", type=str, default="stabilityai/sd-vae-ft-ema")
 
     # Training Hyperparameters
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--min_lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
-    parser.add_argument("--device", type=str, default="mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--sample_steps", type=int, default=50)
+    parser.add_argument("--visualize_every", type=int, default=500)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
     # WandB
     parser.add_argument("--project", type=str, default=None)
@@ -40,6 +50,85 @@ def parse_args():
     parser.add_argument("--run_name", type=str, default=None)
 
     return parser.parse_args()
+
+@torch.no_grad()
+def encode_to_latent(vae: AutoencoderKL, images: torch.Tensor) -> torch.Tensor:
+    return vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
+
+@torch.no_grad()
+def decode_from_latent(vae: AutoencoderKL, latent: torch.Tensor) -> torch.Tensor:
+    return vae.decode(latent / vae.config.scaling_factor).sample
+
+@torch.no_grad()
+def sample(model: DiT, known_latent: torch.Tensor, latent_mask: torch.Tensor, steps: int) -> torch.Tensor:
+    """
+    Generate latents by integrating the learned velocity field from pure noise
+    (t=1) back to data (t=0) with Euler steps.
+    """
+    latent = torch.randn_like(known_latent)
+    timesteps = torch.linspace(1.0, 0.0, steps + 1, device=latent.device)
+
+    for i in range(steps):
+        timestep = timesteps[i].expand(latent.shape[0])
+        velocity = model(latent, timestep, known_latent, latent_mask)
+        latent = latent - (timesteps[i] - timesteps[i + 1]) * velocity
+
+    return latent
+
+def visualize(model, vae, images, mask, args, run_log_dir, epoch, step, use_wandb, run):
+    """Outpaint the first image of the batch and save input/output side by side."""
+    model.eval()
+
+    image = images[:1]
+    image_mask = mask[:1]
+    masked_image = image * image_mask
+    known_latent = encode_to_latent(vae, masked_image)
+    latent_mask = F.interpolate(image_mask, size=known_latent.shape[-2:], mode="nearest")
+
+    generated_latent = sample(model, known_latent, latent_mask, args.sample_steps)
+    generated = decode_from_latent(vae, generated_latent)
+
+    # Keep the original pixels where they are known
+    generated = image * image_mask + generated * (1 - image_mask)
+
+    masked_view = (masked_image[0].float().cpu() * 0.5 + 0.5).clamp(0, 1).permute(1, 2, 0).numpy()
+    generated_view = (generated[0].float().cpu() * 0.5 + 0.5).clamp(0, 1).permute(1, 2, 0).numpy()
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+    axes[0].imshow(masked_view)
+    axes[0].set_title("Known region")
+    axes[0].axis("off")
+
+    axes[1].imshow(generated_view)
+    axes[1].set_title("Outpainted")
+    axes[1].axis("off")
+
+    plt.suptitle(f"Epoch {epoch + 1}, Iteration {step}")
+
+    save_path = os.path.join(run_log_dir, f"epoch_{epoch + 1}_iteration_{step}.png")
+    plt.savefig(save_path)
+
+    if use_wandb:
+        run.log({"Visualization": wandb.Image(fig)})
+    plt.close(fig)
+
+    model.train()
+
+def flow_matching_loss(model, vae, images, mask, criterion):
+    latent = encode_to_latent(vae, images)
+    known_latent = encode_to_latent(vae, images * mask)
+    latent_mask = F.interpolate(mask, size=latent.shape[-2:], mode="nearest")
+
+    # Flow matching: interpolate between data (t=0) and noise (t=1),
+    # the model learns the constant velocity from data to noise
+    noise = torch.randn_like(latent)
+    timestep = torch.rand(latent.shape[0], device=latent.device)
+    t = timestep.view(-1, 1, 1, 1)
+    noisy_latent = (1 - t) * latent + t * noise
+    velocity_target = noise - latent
+
+    velocity_prediction = model(noisy_latent, timestep, known_latent, latent_mask)
+    return criterion(velocity_prediction, velocity_target)
 
 def main():
     args = parse_args()
@@ -54,30 +143,33 @@ def main():
     with open(os.path.join(run_log_dir, "hyperparameters.yaml"), "w") as f:
         yaml.dump(vars(args), f)
 
+    run = None
     if use_wandb:
         run = wandb.init(
             entity=args.entity,
             project=args.project,
             name=args.run_name,
-            config={
-                "embedding_dim": args.embedding_dim,
-                "input_image_size": args.input_image_size,
-                "output_image_size": args.output_image_size,
-                "epochs": args.epochs,
-                "batch_size": args.batch_size,
-                "lr": args.lr,
-                "min_lr": args.min_lr,
-                "weight_decay": args.weight_decay,
-            },
+            config=vars(args),
         )
 
-    train_loader, val_loader = prepare_dataset(args.dataset_path, args.batch_size, image_size=args.output_image_size)
+    train_loader, val_loader = prepare_dataset(args.dataset_path, args.batch_size, canvas_size=args.canvas_size)
 
-    model = SuperResolution(
-        embedding_dim=args.embedding_dim,
-        input_image_size=args.input_image_size,
+    # Frozen pretrained VAE: only the DiT is trained
+    vae = AutoencoderKL.from_pretrained(args.vae).to(args.device)
+    vae.requires_grad_(False)
+    vae.eval()
+
+    model = DiT(
+        latent_size=args.canvas_size // VAE_DOWNSAMPLE_FACTOR,
+        patch_size=args.patch_size,
+        hidden_dim=args.hidden_dim,
+        depth=args.depth,
+        num_head=args.num_head,
     ).to(args.device)
     print(f"Model Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    # bf16 autocast on CUDA, full precision elsewhere
+    autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if args.device.startswith("cuda") else nullcontext()
 
     # Optimizer & Scheduler
     criterion = nn.MSELoss()
@@ -92,14 +184,13 @@ def main():
         epoch_train_loss = []
 
         for step, (images, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")):
-            # Downsample for model input, original image is the target
-            low_resolution_image = F.interpolate(images, size=(args.input_image_size, args.input_image_size), mode='bicubic', align_corners=False).to(args.device)
-            high_resolution_image = images.to(args.device)
+            images = images.to(args.device)
+            mask = sample_known_region_mask(images.shape[0], args.canvas_size, args.device)
 
             # Forward pass
             optimizer.zero_grad()
-            predicted_high_resolution_image = model(low_resolution_image)
-            loss = criterion(predicted_high_resolution_image, high_resolution_image)
+            with autocast:
+                loss = flow_matching_loss(model, vae, images, mask, criterion)
 
             # Backward pass
             loss.backward()
@@ -110,35 +201,9 @@ def main():
             # Record loss
             epoch_train_loss.append(loss.item())
 
-            if step % 100 == 0:
-                # Visualize the first image in the batch
-                lr_img = low_resolution_image[0].detach().cpu()
-                pr_hr_img = predicted_high_resolution_image[0].detach().cpu()
-
-                # Unnormalize [-1, 1] -> [0, 1]
-                lr_img = lr_img * 0.5 + 0.5
-                pr_hr_img = pr_hr_img * 0.5 + 0.5
-
-                lr_img = lr_img.clamp(0, 1).permute(1, 2, 0).numpy()
-                pr_hr_img = pr_hr_img.clamp(0, 1).permute(1, 2, 0).numpy()
-
-                fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-                axes[0].imshow(lr_img)
-                axes[0].set_title(f"Input ({args.input_image_size}x{args.input_image_size})")
-                axes[0].axis("off")
-
-                axes[1].imshow(pr_hr_img)
-                axes[1].set_title(f"Output ({args.output_image_size}x{args.output_image_size})")
-                axes[1].axis("off")
-
-                plt.suptitle(f"Epoch {epoch+1}, Iteration {step}")
-                
-                save_path = os.path.join(run_log_dir, f"epoch_{epoch+1}_iteration_{step}.png")
-                plt.savefig(save_path)
-
-                if use_wandb:
-                    run.log({"Visualization": wandb.Image(fig)})
-                plt.close(fig)
+            if step % args.visualize_every == 0:
+                with autocast:
+                    visualize(model, vae, images, mask, args, run_log_dir, epoch, step, use_wandb, run)
 
         avg_train_loss = np.mean(epoch_train_loss)
         train_losses.append(avg_train_loss)
@@ -147,11 +212,10 @@ def main():
         epoch_val_loss = []
         with torch.no_grad():
             for images, _ in tqdm(val_loader, desc="Validating"):
-                low_resolution_image = F.interpolate(images, size=(args.input_image_size, args.input_image_size), mode='bicubic', align_corners=False).to(args.device)
-                high_resolution_image = images.to(args.device)
-
-                predicted_high_resolution_image = model(low_resolution_image)
-                loss = criterion(predicted_high_resolution_image, high_resolution_image)
+                images = images.to(args.device)
+                mask = sample_known_region_mask(images.shape[0], args.canvas_size, args.device)
+                with autocast:
+                    loss = flow_matching_loss(model, vae, images, mask, criterion)
 
                 # Record loss
                 epoch_val_loss.append(loss.item())
@@ -162,6 +226,8 @@ def main():
         print(f"Epoch {epoch}: Train Loss {avg_train_loss:.4f} | Val Loss {avg_val_loss:.4f}")
         if use_wandb:
             run.log({"Training Loss": train_losses[-1], "Val loss": val_losses[-1]})
+
+        torch.save(model.state_dict(), os.path.join(run_log_dir, "model.pt"))
 
     if not use_wandb:
         plt.plot(train_losses, label="Training loss")

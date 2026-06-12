@@ -1,4 +1,5 @@
 import os
+import random
 import torch
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
@@ -11,19 +12,19 @@ def valid_image_folder(path: str) -> bool:
 
     return True
 
-def prepare_dataset(dataset_path: str, batch_size: int, image_size: int = 256, val_split: float = 0.1) -> tuple[DataLoader, DataLoader]:
+def prepare_dataset(dataset_path: str, batch_size: int, canvas_size: int = 512, val_split: float = 0.1) -> tuple[DataLoader, DataLoader]:
     """
-    Build train and validation dataloaders of high resolution images.
+    Build train and validation dataloaders of full outpainting canvases.
 
     :param dataset_path: Root folder of an ImageFolder-style dataset.
     :param batch_size: Batch size for both loaders.
-    :param image_size: Side length the high resolution images are resized to.
+    :param canvas_size: Side length of the full canvas the model learns to fill.
     :param val_split: Fraction of the dataset held out for validation.
     :return: (train_loader, val_loader)
     """
     # Define image transformations for preprocessing
     transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
+        transforms.Resize((canvas_size, canvas_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
@@ -40,3 +41,31 @@ def prepare_dataset(dataset_path: str, batch_size: int, image_size: int = 256, v
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     return train_loader, val_loader
+
+def sample_known_region_mask(batch_size: int, canvas_size: int, device: str, min_known_fraction: float = 0.5) -> torch.Tensor:
+    """
+    Sample a random known region per image: 1 where pixels are given, 0 where
+    the model must outpaint.
+
+    Each side of the known rectangle is between min_known_fraction and 1.0 of
+    the canvas, so with the default 0.5 the canvas is at most a 2x expansion
+    per dimension. Random placement of the rectangle covers every direction
+    (left, right, up, down, corners) with one model.
+
+    :param batch_size: Number of masks to sample.
+    :param canvas_size: Side length of the canvas.
+    :param device: Device to create the mask on.
+    :param min_known_fraction: Minimum known-side length as a fraction of the canvas.
+    :return: Mask tensor of shape (batch_size, 1, canvas_size, canvas_size).
+    """
+    mask = torch.zeros(batch_size, 1, canvas_size, canvas_size, device=device)
+    minimum_side = int(canvas_size * min_known_fraction)
+
+    for i in range(batch_size):
+        known_height = random.randint(minimum_side, canvas_size)
+        known_width = random.randint(minimum_side, canvas_size)
+        top = random.randint(0, canvas_size - known_height)
+        left = random.randint(0, canvas_size - known_width)
+        mask[i, :, top:top + known_height, left:left + known_width] = 1.0
+
+    return mask
