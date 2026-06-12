@@ -1,6 +1,6 @@
 # Outpainting
 
-A latent flow matching model that expands images beyond their borders (outpainting), trained on ImageNet. A frozen pretrained VAE compresses the canvas into latent space; a DiT (diffusion transformer) conditioned on the known-region latent and mask learns the flow matching velocity field. The known region is randomly sized and placed during training, supporting expansion in any direction up to 2x per dimension (e.g. 512x512 -> 1024x1024).
+A pixel-space flow matching model that expands images beyond their borders (outpainting), trained from scratch on ImageNet with no pretrained components. A DiT (diffusion transformer) folds each 16x16 pixel tile into one token and, conditioned on the masked image and known-region mask, learns the flow matching velocity field. The known region is randomly sized and placed during training, supporting expansion in any direction up to 2x per dimension (e.g. 512x512 -> 1024x1024).
 
 ## Pipeline
 
@@ -16,7 +16,7 @@ A latent flow matching model that expands images beyond their borders (outpainti
 python train.py
 ```
 
-Defaults train on the `ImagenetHighResolution` folder using CUDA if available, falling back to MPS then CPU. The pretrained VAE (`stabilityai/sd-vae-ft-ema`) is downloaded from Hugging Face on first run. bf16 autocast is used automatically on CUDA.
+Defaults train on the `ImagenetHighResolution` folder using CUDA if available, falling back to MPS then CPU. bf16 autocast is used automatically on CUDA.
 
 Common overrides:
 

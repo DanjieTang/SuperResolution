@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from diffusers import AutoencoderKL
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
@@ -17,22 +16,18 @@ import os
 from contextlib import nullcontext
 from datetime import datetime
 
-# The VAE downsamples by 8x, so a 512 canvas becomes a 64x64x4 latent
-VAE_DOWNSAMPLE_FACTOR = 8
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train an Outpainting Model (latent flow matching DiT)")
+    parser = argparse.ArgumentParser(description="Train an Outpainting Model (pixel-space flow matching DiT)")
 
     # Dataset & Paths
     parser.add_argument("--dataset_path", type=str, default="ImagenetHighResolution")
 
     # Model Architecture
     parser.add_argument("--canvas_size", type=int, default=512)
-    parser.add_argument("--patch_size", type=int, default=2)
+    parser.add_argument("--patch_size", type=int, default=16)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--num_head", type=int, default=8)
-    parser.add_argument("--vae", type=str, default="stabilityai/sd-vae-ft-ema")
 
     # Training Hyperparameters
     parser.add_argument("--epochs", type=int, default=1)
@@ -52,41 +47,30 @@ def parse_args():
     return parser.parse_args()
 
 @torch.no_grad()
-def encode_to_latent(vae: AutoencoderKL, images: torch.Tensor) -> torch.Tensor:
-    return vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
-
-@torch.no_grad()
-def decode_from_latent(vae: AutoencoderKL, latent: torch.Tensor) -> torch.Tensor:
-    return vae.decode(latent / vae.config.scaling_factor).sample
-
-@torch.no_grad()
-def sample(model: DiT, known_latent: torch.Tensor, latent_mask: torch.Tensor, steps: int) -> torch.Tensor:
+def sample(model: DiT, known_image: torch.Tensor, mask: torch.Tensor, steps: int) -> torch.Tensor:
     """
-    Generate latents by integrating the learned velocity field from pure noise
+    Generate images by integrating the learned velocity field from pure noise
     (t=1) back to data (t=0) with Euler steps.
     """
-    latent = torch.randn_like(known_latent)
-    timesteps = torch.linspace(1.0, 0.0, steps + 1, device=latent.device)
+    image = torch.randn_like(known_image)
+    timesteps = torch.linspace(1.0, 0.0, steps + 1, device=image.device)
 
     for i in range(steps):
-        timestep = timesteps[i].expand(latent.shape[0])
-        velocity = model(latent, timestep, known_latent, latent_mask)
-        latent = latent - (timesteps[i] - timesteps[i + 1]) * velocity
+        timestep = timesteps[i].expand(image.shape[0])
+        velocity = model(image, timestep, known_image, mask)
+        image = image - (timesteps[i] - timesteps[i + 1]) * velocity
 
-    return latent
+    return image
 
-def visualize(model, vae, images, mask, args, run_log_dir, epoch, step, use_wandb, run):
+def visualize(model, images, mask, args, run_log_dir, epoch, step, use_wandb, run):
     """Outpaint the first image of the batch and save input/output side by side."""
     model.eval()
 
     image = images[:1]
     image_mask = mask[:1]
     masked_image = image * image_mask
-    known_latent = encode_to_latent(vae, masked_image)
-    latent_mask = F.interpolate(image_mask, size=known_latent.shape[-2:], mode="nearest")
 
-    generated_latent = sample(model, known_latent, latent_mask, args.sample_steps)
-    generated = decode_from_latent(vae, generated_latent)
+    generated = sample(model, masked_image, image_mask, args.sample_steps)
 
     # Keep the original pixels where they are known
     generated = image * image_mask + generated * (1 - image_mask)
@@ -114,20 +98,18 @@ def visualize(model, vae, images, mask, args, run_log_dir, epoch, step, use_wand
 
     model.train()
 
-def flow_matching_loss(model, vae, images, mask, criterion):
-    latent = encode_to_latent(vae, images)
-    known_latent = encode_to_latent(vae, images * mask)
-    latent_mask = F.interpolate(mask, size=latent.shape[-2:], mode="nearest")
+def flow_matching_loss(model, images, mask, criterion):
+    masked_image = images * mask
 
     # Flow matching: interpolate between data (t=0) and noise (t=1),
     # the model learns the constant velocity from data to noise
-    noise = torch.randn_like(latent)
-    timestep = torch.rand(latent.shape[0], device=latent.device)
+    noise = torch.randn_like(images)
+    timestep = torch.rand(images.shape[0], device=images.device)
     t = timestep.view(-1, 1, 1, 1)
-    noisy_latent = (1 - t) * latent + t * noise
-    velocity_target = noise - latent
+    noisy_image = (1 - t) * images + t * noise
+    velocity_target = noise - images
 
-    velocity_prediction = model(noisy_latent, timestep, known_latent, latent_mask)
+    velocity_prediction = model(noisy_image, timestep, masked_image, mask)
     return criterion(velocity_prediction, velocity_target)
 
 def main():
@@ -154,13 +136,8 @@ def main():
 
     train_loader, val_loader = prepare_dataset(args.dataset_path, args.batch_size, canvas_size=args.canvas_size)
 
-    # Frozen pretrained VAE: only the DiT is trained
-    vae = AutoencoderKL.from_pretrained(args.vae).to(args.device)
-    vae.requires_grad_(False)
-    vae.eval()
-
     model = DiT(
-        latent_size=args.canvas_size // VAE_DOWNSAMPLE_FACTOR,
+        image_size=args.canvas_size,
         patch_size=args.patch_size,
         hidden_dim=args.hidden_dim,
         depth=args.depth,
@@ -190,7 +167,7 @@ def main():
             # Forward pass
             optimizer.zero_grad()
             with autocast:
-                loss = flow_matching_loss(model, vae, images, mask, criterion)
+                loss = flow_matching_loss(model, images, mask, criterion)
 
             # Backward pass
             loss.backward()
@@ -203,7 +180,7 @@ def main():
 
             if step % args.visualize_every == 0:
                 with autocast:
-                    visualize(model, vae, images, mask, args, run_log_dir, epoch, step, use_wandb, run)
+                    visualize(model, images, mask, args, run_log_dir, epoch, step, use_wandb, run)
 
         avg_train_loss = np.mean(epoch_train_loss)
         train_losses.append(avg_train_loss)
@@ -215,7 +192,7 @@ def main():
                 images = images.to(args.device)
                 mask = sample_known_region_mask(images.shape[0], args.canvas_size, args.device)
                 with autocast:
-                    loss = flow_matching_loss(model, vae, images, mask, criterion)
+                    loss = flow_matching_loss(model, images, mask, criterion)
 
                 # Record loss
                 epoch_val_loss.append(loss.item())

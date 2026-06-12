@@ -104,20 +104,23 @@ class FinalLayer(nn.Module):
 
 class DiT(nn.Module):
     """
-    Diffusion transformer for outpainting in VAE latent space.
+    Diffusion transformer for outpainting, working directly in pixel space.
 
-    Predicts the flow matching velocity for the noisy latent, conditioned on
-    the timestep, the latent of the masked (known pixels only) image, and the
-    known-region mask. Inputs are concatenated along channels:
-    4 noisy latent + 4 known latent + 1 mask = 9.
+    Predicts the flow matching velocity for the noisy image, conditioned on
+    the timestep, the masked (known pixels only) image, and the known-region
+    mask. Inputs are concatenated along channels:
+    3 noisy image + 3 masked image + 1 mask = 7.
+
+    The patch embedding folds each patch_size x patch_size tile into one
+    token, the same tiling trick as in the super resolution attention.
     """
 
     def __init__(
         self,
-        latent_size: int = 64,
-        patch_size: int = 2,
-        in_channels: int = 9,
-        out_channels: int = 4,
+        image_size: int = 512,
+        patch_size: int = 16,
+        in_channels: int = 7,
+        out_channels: int = 3,
         hidden_dim: int = 512,
         depth: int = 12,
         num_head: int = 8,
@@ -125,7 +128,7 @@ class DiT(nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.out_channels = out_channels
-        self.token_per_side = latent_size // patch_size
+        self.token_per_side = image_size // patch_size
 
         self.patch_embed = nn.Conv2d(in_channels, hidden_dim, kernel_size=patch_size, stride=patch_size)
         self.positional_encoding = nn.Parameter(torch.randn(1, self.token_per_side ** 2, hidden_dim) * 0.02)
@@ -143,12 +146,12 @@ class DiT(nn.Module):
 
     def forward(
         self,
-        noisy_latent: torch.Tensor,
+        noisy_image: torch.Tensor,
         timestep: torch.Tensor,
-        known_latent: torch.Tensor,
+        known_image: torch.Tensor,
         known_mask: torch.Tensor,
     ) -> torch.Tensor:
-        tensor = torch.cat([noisy_latent, known_latent, known_mask], dim=1)
+        tensor = torch.cat([noisy_image, known_image, known_mask], dim=1)
 
         tokens = self.patch_embed(tensor).flatten(2).transpose(1, 2)
         tokens = tokens + self.positional_encoding
