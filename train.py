@@ -202,13 +202,30 @@ def main():
     # Tracking metrics
     train_losses, val_losses = [], []
 
+    # Set DIAG=1 to print where per-step wall time goes (data wait vs mask vs compute)
+    diag = os.environ.get("DIAG") == "1"
+    import time
+    t_data = t_mask = t_compute = 0.0
+    n_timed = 0
+    cuda = args.device.startswith("cuda")
+
     for epoch in range(args.epochs):
         model.train()
         epoch_train_loss = []
 
+        loop_end = time.perf_counter()
         for step, (images, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")):
+            if diag:
+                t_data += time.perf_counter() - loop_end
+                t0 = time.perf_counter()
+
             images = images.to(args.device, non_blocking=True)
             mask = sample_known_region_mask(images.shape[0], args.canvas_size, args.device)
+
+            if diag:
+                if cuda: torch.cuda.synchronize()
+                t_mask += time.perf_counter() - t0
+                t0 = time.perf_counter()
 
             # Forward pass
             optimizer.zero_grad()
@@ -223,6 +240,17 @@ def main():
 
             # Record loss
             epoch_train_loss.append(loss.item())
+
+            if diag:
+                if cuda: torch.cuda.synchronize()
+                t_compute += time.perf_counter() - t0
+                n_timed += 1
+                if n_timed % 50 == 0:
+                    print(f"\n[DIAG] per-step avg over {n_timed}: "
+                          f"data_wait={1000*t_data/n_timed:.1f}ms  "
+                          f"mask={1000*t_mask/n_timed:.1f}ms  "
+                          f"compute={1000*t_compute/n_timed:.1f}ms")
+                loop_end = time.perf_counter()
 
             if step % args.visualize_every == 0:
                 with autocast:
