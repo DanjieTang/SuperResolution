@@ -207,7 +207,7 @@ def main():
         epoch_train_loss = []
 
         for step, (images, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")):
-            images = images.to(args.device)
+            images = images.to(args.device, non_blocking=True)
             mask = sample_known_region_mask(images.shape[0], args.canvas_size, args.device)
 
             # Forward pass
@@ -235,7 +235,7 @@ def main():
         epoch_val_loss = []
         with torch.no_grad():
             for images, _ in tqdm(val_loader, desc="Validating"):
-                images = images.to(args.device)
+                images = images.to(args.device, non_blocking=True)
                 mask = sample_known_region_mask(images.shape[0], args.canvas_size, args.device)
                 with autocast:
                     loss = flow_matching_loss(model, vae, images, mask, criterion)

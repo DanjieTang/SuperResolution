@@ -12,7 +12,7 @@ def valid_image_folder(path: str) -> bool:
 
     return True
 
-def prepare_dataset(dataset_path: str, batch_size: int, canvas_size: int = 512, val_split: float = 0.1) -> tuple[DataLoader, DataLoader]:
+def prepare_dataset(dataset_path: str, batch_size: int, canvas_size: int = 512, val_split: float = 0.1, num_workers: int | None = None) -> tuple[DataLoader, DataLoader]:
     """
     Build train and validation dataloaders of full outpainting canvases.
 
@@ -20,8 +20,13 @@ def prepare_dataset(dataset_path: str, batch_size: int, canvas_size: int = 512, 
     :param batch_size: Batch size for both loaders.
     :param canvas_size: Side length of the full canvas the model learns to fill.
     :param val_split: Fraction of the dataset held out for validation.
+    :param num_workers: Background processes that decode/resize batches ahead of
+        the GPU. Defaults to the CPU count so the GPU is never starved waiting on
+        image loading. Set to 0 to load synchronously on the main process.
     :return: (train_loader, val_loader)
     """
+    if num_workers is None:
+        num_workers = os.cpu_count() or 0
     # Define image transformations for preprocessing
     transform = transforms.Compose([
         transforms.Resize((canvas_size, canvas_size)),
@@ -36,9 +41,15 @@ def prepare_dataset(dataset_path: str, batch_size: int, canvas_size: int = 512, 
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    # Create DataLoaders for training and validation
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    # Create DataLoaders for training and validation. Background workers prefetch
+    # and prepare batches while the GPU is busy, pin_memory speeds host->GPU copies,
+    # and persistent_workers avoids re-spawning workers every epoch.
+    loader_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+    if num_workers > 0:
+        loader_kwargs.update(persistent_workers=True, prefetch_factor=4)
+
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
     return train_loader, val_loader
 
