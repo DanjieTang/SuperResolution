@@ -37,6 +37,40 @@ def prepare_dataset(dataset_path: str, batch_size: int, canvas_size: int = 512, 
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
     # Create DataLoaders for training and validation
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=8, pin_memory=True, persistent_workers=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=4, pin_memory=True, persistent_workers=True)
+
+    return train_loader, val_loader
+
+def prepare_raw_loader(dataset_path: str, batch_size: int, canvas_size: int = 512) -> DataLoader:
+    """
+    A single, deterministically-ordered loader over the full dataset, used to
+    encode every image to VAE latents exactly once (see precompute_latents).
+    """
+    transform = transforms.Compose([
+        transforms.Resize((canvas_size, canvas_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    dataset = datasets.ImageFolder(root=dataset_path, is_valid_file=valid_image_folder, transform=transform)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                      num_workers=8, pin_memory=True)
+
+def prepare_latent_loaders(moments: torch.Tensor, batch_size: int, val_split: float = 0.1) -> tuple[DataLoader, DataLoader]:
+    """
+    Build train/val loaders directly from precomputed VAE latent moments
+    (the raw 8-channel mean/logvar tensor the encoder produces per image).
+    No images are read or encoded during training.
+    """
+    labels = torch.zeros(moments.shape[0])
+    dataset = torch.utils.data.TensorDataset(moments, labels)
+
+    train_size = int((1 - val_split) * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 

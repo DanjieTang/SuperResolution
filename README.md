@@ -5,8 +5,10 @@ A pixel-space flow matching model that expands images beyond their borders (outp
 ## Pipeline
 
 - `model.py` — `TimestepEmbedding`, `DiTBlock` (adaLN-zero), and the `DiT` network.
-- `dataloader.py` — canvas dataloaders plus random known-region mask sampling.
+- `dataloader.py` — canvas dataloaders, latent loaders, plus random known-region mask sampling.
 - `train.py` — flow matching training entry point with CLI arguments and optional W&B logging.
+- `precompute_latents.py` — one-time script that encodes the dataset to VAE latents on disk (latent mode only).
+- `latents.py` — shared helpers for saving, loading, and sampling those cached latents.
 - `run_sweep.py` / `sweep_config.yaml` — grid search over hyperparameters with resume support.
 - `super_resolution/` — the previous project: a 4x super resolution model (64x64 -> 256x256).
 
@@ -30,9 +32,21 @@ Enable W&B logging by passing both `--project` and `--entity`.
 
 Passing `--use_vae` trains in the latent space of a frozen pretrained VAE (`stabilityai/sd-vae-ft-ema`, downloaded from Hugging Face on first run) instead of pixel space. The patch size defaults to 2 on the 8x-smaller latents, keeping the token count identical. Requires the optional dependency: `uv sync --extra vae`.
 
+Because the VAE is frozen, latents are **precomputed once to disk** rather than re-encoded every step. This is a two-step workflow:
+
 ```bash
-python train.py --use_vae
+# 1. Encode the dataset to latents on disk (run once per dataset/canvas/VAE)
+python precompute_latents.py --dataset_path ImagenetHighResolution --output latent_cache/latents.pt
+
+# 2. Train, reading latents from disk (no VAE encoding in the loop)
+python train.py --use_vae --latent_cache latent_cache/latents.pt
 ```
+
+`--latent_cache` defaults to `latent_cache/latents.pt`, so if you keep the defaults the second command is just `python train.py --use_vae`. If the cache is missing, training stops and prints the exact precompute command to run.
+
+> **Why two steps:** encoding the dataset is the expensive part of latent training. Doing it every step (twice per step, on the full-resolution image) made `--use_vae` roughly 7.5x slower than pixel mode. Precomputing it once brings latent training back to roughly pixel-mode speed, and the cache is reused across epochs and runs.
+
+**Latent-space masking.** In latent mode the known region is formed by masking the cached latent directly (`latent * mask`), rather than encoding the masked pixels. This is what makes caching possible and is the standard latent-inpainting approach; it differs slightly from pixel mode, which still masks in pixel space.
 
 ## Hyperparameter sweep
 
