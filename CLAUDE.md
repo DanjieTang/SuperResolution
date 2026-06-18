@@ -33,22 +33,33 @@ the identity when `vae is None` (pixel mode).
 The VAE is frozen, so its encodings never change. Encoding on the fly was the
 entire performance problem (two full-res encodes per step ≈ 7.5x slowdown), so:
 
-1. `precompute_latents.py` encodes the dataset **once** and stores the raw
-   8-channel VAE moments (mean, logvar) to disk via `latents.save_latents`.
-2. `train.py --use_vae` reads them with `latents.load_latents`, then each step
-   draws a fresh latent with `latents.sample_latent` (so VAE sampling
-   stochasticity is preserved — we cache moments, not a fixed sample).
+1. `precompute_latents.py` encodes the dataset **once**, writing one file per
+   image (raw 8-channel VAE moments, mean/logvar) into a directory tree that
+   mirrors the source dataset, via `latents.save_latent_moment`. A single
+   `cache_meta.pt` (scaling factor + provenance) is written at the cache root by
+   `latents.save_cache_meta`. Each image is encoded and written as it is read,
+   so memory stays flat, and re-running skips images whose `.pt` already exists.
+2. `train.py --use_vae` reads `scaling_factor` once via `latents.load_cache_meta`
+   and streams moments through `dataloader.prepare_latent_loaders`, which builds
+   a `LatentFolderDataset` that loads one moments file per access (the full cache
+   is never resident). Each step draws a fresh latent with `latents.sample_latent`
+   (so VAE sampling stochasticity is preserved — we cache moments, not a sample).
 
 The training loop performs **zero VAE encodes**. The VAE is still loaded in
 `train.py` but only to `decode` samples during visualization.
 
 ### Invariants to keep when editing latent mode
 
-- Moments are stored as fp16, shape `(N, 8, H, W)`; `sample_latent` chunks into
+- Moments are stored as fp16, one file per image of shape `(8, H, W)`; the
+  loader stacks them to `(B, 8, H, W)` and `sample_latent` chunks into
   mean/logvar, clamps logvar to `[-30, 20]`, and scales by `scaling_factor`.
   This must stay consistent with diffusers' `DiagonalGaussianDistribution`.
-- `scaling_factor` is read from the cache, not from `vae.config`, so training
-  does not depend on the VAE being loaded for sampling.
+- `scaling_factor` is read from `cache_meta.pt`, not from `vae.config`, so
+  training does not depend on the VAE being loaded for sampling.
+- The cache dir mirrors the dataset tree (`<root>/<class>/<name>.pt`).
+  `cache_meta.pt` lives at the root and is excluded from the moment-file scan
+  (`dataloader.list_latent_files`). Deleting an image's `.pt` re-encodes just
+  that image on the next precompute run.
 - **Latent-space masking**: known region is `working * working_mask` in latent
   space. Do NOT reintroduce `encode(masked_pixels)` in the loop — that is the
   uncacheable, slow path we removed. Pixel mode still masks in pixel space; this

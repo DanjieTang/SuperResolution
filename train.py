@@ -1,5 +1,5 @@
 from dataloader import prepare_dataset, prepare_latent_loaders, sample_known_region_mask
-from latents import load_latents, sample_latent
+from latents import CACHE_META_NAME, load_cache_meta, sample_latent
 from model import DiT
 
 import torch
@@ -37,8 +37,8 @@ def parse_args():
     # instead of raw pixels (downloads the VAE from Hugging Face)
     parser.add_argument("--use_vae", action="store_true")
     parser.add_argument("--vae", type=str, default="stabilityai/sd-vae-ft-ema")
-    parser.add_argument("--latent_cache", type=str, default="latent_cache/latents.pt",
-                        help="Precomputed latents from precompute_latents.py; read instead of encoding")
+    parser.add_argument("--latent_cache", type=str, default="latent_cache",
+                        help="Precomputed latent cache dir from precompute_latents.py; read instead of encoding")
 
     # Training Hyperparameters
     parser.add_argument("--epochs", type=int, default=1)
@@ -171,7 +171,7 @@ def main():
             from diffusers import AutoencoderKL
         except ImportError:
             raise ImportError("--use_vae requires diffusers: run 'uv sync --extra vae' or 'pip install diffusers'")
-        if not os.path.exists(args.latent_cache):
+        if not os.path.exists(os.path.join(args.latent_cache, CACHE_META_NAME)):
             raise FileNotFoundError(
                 f"No latent cache at '{args.latent_cache}'. Precompute it once with:\n"
                 f"  python precompute_latents.py --dataset_path {args.dataset_path} "
@@ -183,9 +183,10 @@ def main():
         vae.requires_grad_(False)
         vae.eval()
 
-        moments, scaling_factor = load_latents(args.latent_cache)
-        print(f"Loaded {moments.shape[0]} cached latents from {args.latent_cache}")
-        train_loader, val_loader = prepare_latent_loaders(moments, args.batch_size)
+        scaling_factor, _ = load_cache_meta(args.latent_cache)
+        train_loader, val_loader = prepare_latent_loaders(args.latent_cache, args.batch_size)
+        n_cached = len(train_loader.dataset) + len(val_loader.dataset)
+        print(f"Loaded {n_cached} cached latents from {args.latent_cache}")
     else:
         train_loader, val_loader = prepare_dataset(args.dataset_path, args.batch_size, canvas_size=args.canvas_size)
 
