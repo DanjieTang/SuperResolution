@@ -1,12 +1,8 @@
-import glob
 import os
 import random
 import torch
-from PIL import Image
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
-
-from latents import CACHE_META_NAME, load_latent_moment
 
 
 def _canvas_transform(canvas_size: int) -> transforms.Compose:
@@ -46,83 +42,6 @@ def prepare_dataset(dataset_path: str, batch_size: int, canvas_size: int = 512, 
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
     # Create DataLoaders for training and validation
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=8, pin_memory=True, persistent_workers=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
-                            num_workers=4, pin_memory=True, persistent_workers=True)
-
-    return train_loader, val_loader
-
-class ImagePathDataset(torch.utils.data.Dataset):
-    """
-    Yields (transformed_image, destination_path) for the precompute pass.
-    Carrying the per-image output path through the loader lets the encoder
-    write each moment to its own mirrored cache file, so nothing accumulates
-    in RAM (default collate returns the paths as a list of strings).
-    """
-
-    def __init__(self, pairs: list[tuple[str, str]], canvas_size: int = 512):
-        self.pairs = pairs
-        self.transform = _canvas_transform(canvas_size)
-
-    def __len__(self) -> int:
-        return len(self.pairs)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, str]:
-        src_path, dst_path = self.pairs[index]
-        image = Image.open(src_path).convert("RGB")
-        return self.transform(image), dst_path
-
-
-class LatentFolderDataset(torch.utils.data.Dataset):
-    """
-    Lazily loads one precomputed moments file per access, so training never
-    holds the whole cache in memory. Labels are unused (outpainting is
-    unconditional) and returned as a constant to match the (x, _) loop.
-    """
-
-    def __init__(self, files: list[str]):
-        self.files = files
-
-    def __len__(self) -> int:
-        return len(self.files)
-
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        return load_latent_moment(self.files[index]), 0
-
-
-def list_latent_files(latent_dir: str) -> list[str]:
-    """All per-image moment files under the cache, excluding the metadata file."""
-    files = glob.glob(os.path.join(latent_dir, "**", "*.pt"), recursive=True)
-    return sorted(p for p in files if os.path.basename(p) != CACHE_META_NAME)
-
-
-def prepare_raw_loader(dataset_path: str, batch_size: int, canvas_size: int = 512) -> DataLoader:
-    """
-    A single, deterministically-ordered loader over the full dataset, used to
-    encode every image to VAE latents exactly once (see precompute_latents).
-    """
-    transform = _canvas_transform(canvas_size)
-    dataset = datasets.ImageFolder(root=dataset_path, is_valid_file=valid_image_folder, transform=transform)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                      num_workers=8, pin_memory=True)
-
-def prepare_latent_loaders(latent_dir: str, batch_size: int, val_split: float = 0.1) -> tuple[DataLoader, DataLoader]:
-    """
-    Build train/val loaders over a directory of precomputed per-image moment
-    files (the raw 8-channel mean/logvar tensors the encoder produced). Files
-    are read lazily by the loader workers; no images are read or encoded, and
-    the full cache is never resident in memory.
-    """
-    files = list_latent_files(latent_dir)
-    if not files:
-        raise FileNotFoundError(f"No latent .pt files found under '{latent_dir}'")
-    dataset = LatentFolderDataset(files)
-
-    train_size = int((1 - val_split) * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                               num_workers=8, pin_memory=True, persistent_workers=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,

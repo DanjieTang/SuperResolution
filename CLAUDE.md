@@ -23,47 +23,42 @@ The token count is identical in both modes, so the DiT itself costs the same.
 `flow_matching_loss(model, working, working_mask, criterion)` and
 `visualize(model, vae, working, mask, ...)` both operate purely in working
 space. The training loop produces `working` before calling them:
-`working = sample_latent(x, scaling_factor) if args.use_vae else x`.
+`working = encode(vae, x)`.
 
-`decode(vae, tensor)` maps working space back to pixels for visualization and is
-the identity when `vae is None` (pixel mode).
+`encode(vae, pixels)` maps pixels into working space (sampled, scaled VAE latent)
+and `decode(vae, tensor)` maps working space back to pixels for visualization.
+Both are the identity when `vae is None` (pixel mode).
 
-## Latent mode is a precompute-then-train workflow
+## Latent mode encodes on the fly
 
-The VAE is frozen, so its encodings never change. Encoding on the fly was the
-entire performance problem (two full-res encodes per step ≈ 7.5x slowdown), so:
+The VAE is frozen, so it is loaded once and used for both directions:
+`train.py:encode` maps a pixel batch into working space and `decode` maps
+samples back for visualization. `train.py --use_vae` loads the same pixel
+dataloader as pixel mode (`dataloader.prepare_dataset`); each step encodes that
+batch to a latent in the loop:
+`working = encode(vae, x)` (identity when `vae is None`, i.e. pixel mode).
 
-1. `precompute_latents.py` encodes the dataset **once**, writing one file per
-   image (raw 8-channel VAE moments, mean/logvar) into a directory tree that
-   mirrors the source dataset, via `latents.save_latent_moment`. A single
-   `cache_meta.pt` (scaling factor + provenance) is written at the cache root by
-   `latents.save_cache_meta`. Each image is encoded and written as it is read,
-   so memory stays flat, and re-running skips images whose `.pt` already exists.
-2. `train.py --use_vae` reads `scaling_factor` once via `latents.load_cache_meta`
-   and streams moments through `dataloader.prepare_latent_loaders`, which builds
-   a `LatentFolderDataset` that loads one moments file per access (the full cache
-   is never resident). Each step draws a fresh latent with `latents.sample_latent`
-   (so VAE sampling stochasticity is preserved — we cache moments, not a sample).
+`encode` samples a fresh latent every call
+(`vae.encode(pixels).latent_dist.sample() * vae.config.scaling_factor`), so the
+encoder's sampling stochasticity is preserved across epochs.
 
-The training loop performs **zero VAE encodes**. The VAE is still loaded in
-`train.py` but only to `decode` samples during visualization.
+> Earlier this repo precomputed latents to disk to avoid encoding in the loop.
+> That cache grew to ~75 GB of tiny files and a write failed mid-run, so we
+> reverted to on-the-fly encoding. The current path does **one** encode per step
+> (mask in latent space, see below), not the two-encode path that originally
+> motivated the cache, so the slowdown is roughly half what it was.
 
 ### Invariants to keep when editing latent mode
 
-- Moments are stored as fp16, one file per image of shape `(8, H, W)`; the
-  loader stacks them to `(B, 8, H, W)` and `sample_latent` chunks into
-  mean/logvar, clamps logvar to `[-30, 20]`, and scales by `scaling_factor`.
-  This must stay consistent with diffusers' `DiagonalGaussianDistribution`.
-- `scaling_factor` is read from `cache_meta.pt`, not from `vae.config`, so
-  training does not depend on the VAE being loaded for sampling.
-- The cache dir mirrors the dataset tree (`<root>/<class>/<name>.pt`).
-  `cache_meta.pt` lives at the root and is excluded from the moment-file scan
-  (`dataloader.list_latent_files`). Deleting an image's `.pt` re-encodes just
-  that image on the next precompute run.
+- `scaling_factor` comes from `vae.config.scaling_factor` and must be applied in
+  `encode` and undone in `decode` (they are inverses). The VAE must be loaded
+  for training, not just visualization.
 - **Latent-space masking**: known region is `working * working_mask` in latent
-  space. Do NOT reintroduce `encode(masked_pixels)` in the loop — that is the
-  uncacheable, slow path we removed. Pixel mode still masks in pixel space; this
-  asymmetry is intentional.
+  space. Do NOT add a second `encode(masked_pixels)` in the loop — encode the
+  full image once and mask the resulting latent. Pixel mode still masks in pixel
+  space; this asymmetry is intentional.
+- The VAE encode is wrapped in the same bf16 autocast as the rest of the step on
+  CUDA, and runs under `@torch.no_grad` (we never backprop through the encoder).
 - Masks are sampled at the working resolution directly
   (`sample_known_region_mask(B, working.shape[-1], device)`), not at canvas size
   then interpolated.
@@ -81,9 +76,9 @@ The training loop performs **zero VAE encodes**. The VAE is still loaded in
 ## Gotchas
 
 - `dataloader.py:valid_image_folder` filters macOS `._*` / `.DS_Store` files.
-- Changing dataset, `--canvas_size`, or `--vae` requires regenerating the latent
-  cache; there is no automatic invalidation — the cache path is whatever
-  `--output` / `--latent_cache` points at.
+- Latent mode re-encodes every image each epoch (no caching), so `--use_vae` is
+  slower per step than pixel mode; this is the deliberate trade for not storing a
+  large latent cache to disk.
 - Training and inference must agree on masking semantics; if you change one of
   `flow_matching_loss` / `visualize` / `sample`, check the others.
 
@@ -92,7 +87,7 @@ The training loop performs **zero VAE encodes**. The VAE is still loaded in
 There is no test suite. After edits, at minimum:
 
 ```bash
-python -m py_compile train.py dataloader.py latents.py precompute_latents.py
+python -m py_compile train.py dataloader.py
 ```
 
 End-to-end runs need the ImageNet dataset and a CUDA GPU (DGX Spark); the

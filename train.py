@@ -1,5 +1,4 @@
-from dataloader import prepare_dataset, prepare_latent_loaders, sample_known_region_mask
-from latents import CACHE_META_NAME, load_cache_meta, sample_latent
+from dataloader import prepare_dataset, sample_known_region_mask
 from model import DiT
 
 import torch
@@ -37,8 +36,6 @@ def parse_args():
     # instead of raw pixels (downloads the VAE from Hugging Face)
     parser.add_argument("--use_vae", action="store_true")
     parser.add_argument("--vae", type=str, default="stabilityai/sd-vae-ft-ema")
-    parser.add_argument("--latent_cache", type=str, default="latent_cache",
-                        help="Precomputed latent cache dir from precompute_latents.py; read instead of encoding")
 
     # Training Hyperparameters
     parser.add_argument("--epochs", type=int, default=1)
@@ -59,6 +56,17 @@ def parse_args():
     if args.patch_size is None:
         args.patch_size = 2 if args.use_vae else 16
     return args
+
+@torch.no_grad()
+def encode(vae, pixels: torch.Tensor) -> torch.Tensor:
+    """
+    Map pixels into the model's working space. Identity in pixel mode; in latent
+    mode this is the (frozen) VAE encode, sampling a fresh latent each call so
+    the encoder's stochasticity is preserved, then scaling into working space.
+    """
+    if vae is None:
+        return pixels
+    return vae.encode(pixels).latent_dist.sample() * vae.config.scaling_factor
 
 @torch.no_grad()
 def decode(vae, tensor: torch.Tensor) -> torch.Tensor:
@@ -163,32 +171,20 @@ def main():
             config=vars(args),
         )
 
-    # Frozen pretrained VAE (latent diffusion) or raw pixel space
+    # Frozen pretrained VAE (latent diffusion) or raw pixel space. The VAE
+    # encodes each batch to latents on the fly in the loop and decodes samples
+    # for visualization; nothing is precomputed or stored to disk.
     vae = None
-    scaling_factor = 1.0
     if args.use_vae:
         try:
             from diffusers import AutoencoderKL
         except ImportError:
             raise ImportError("--use_vae requires diffusers: run 'uv sync --extra vae' or 'pip install diffusers'")
-        if not os.path.exists(os.path.join(args.latent_cache, CACHE_META_NAME)):
-            raise FileNotFoundError(
-                f"No latent cache at '{args.latent_cache}'. Precompute it once with:\n"
-                f"  python precompute_latents.py --dataset_path {args.dataset_path} "
-                f"--canvas_size {args.canvas_size} --vae {args.vae} --output {args.latent_cache}"
-            )
-        # The VAE is loaded only to decode samples for visualization; the
-        # training loop reads latents from disk and never encodes.
         vae = AutoencoderKL.from_pretrained(args.vae).to(args.device)
         vae.requires_grad_(False)
         vae.eval()
 
-        scaling_factor, _ = load_cache_meta(args.latent_cache)
-        train_loader, val_loader = prepare_latent_loaders(args.latent_cache, args.batch_size)
-        n_cached = len(train_loader.dataset) + len(val_loader.dataset)
-        print(f"Loaded {n_cached} cached latents from {args.latent_cache}")
-    else:
-        train_loader, val_loader = prepare_dataset(args.dataset_path, args.batch_size, canvas_size=args.canvas_size)
+    train_loader, val_loader = prepare_dataset(args.dataset_path, args.batch_size, canvas_size=args.canvas_size)
 
     working_channels = 4 if args.use_vae else 3
     working_size = args.canvas_size // VAE_DOWNSAMPLE_FACTOR if args.use_vae else args.canvas_size
@@ -221,7 +217,8 @@ def main():
 
         for step, (x, _) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Train]")):
             x = x.to(args.device)
-            working = sample_latent(x, scaling_factor) if args.use_vae else x
+            with autocast:
+                working = encode(vae, x)
             mask = sample_known_region_mask(working.shape[0], working.shape[-1], args.device)
 
             # Forward pass
@@ -250,9 +247,9 @@ def main():
         with torch.no_grad():
             for x, _ in tqdm(val_loader, desc="Validating"):
                 x = x.to(args.device)
-                working = sample_latent(x, scaling_factor) if args.use_vae else x
-                mask = sample_known_region_mask(working.shape[0], working.shape[-1], args.device)
                 with autocast:
+                    working = encode(vae, x)
+                    mask = sample_known_region_mask(working.shape[0], working.shape[-1], args.device)
                     loss = flow_matching_loss(model, working, mask, criterion)
 
                 # Record loss
